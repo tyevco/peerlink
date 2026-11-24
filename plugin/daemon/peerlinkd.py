@@ -210,7 +210,7 @@ DEFAULT_CONFIG = {
     "herdr_tab_names": {},  # herdr tab id -> the name herdr sync last left it showing: a tab renamed since renames its agent
     "herdr_join_never": "",  # spaces a tab you open in herdr never joins on its own, comma separated (a space others nest in never does either); agents can add to it, only the web UI removes
     "herdr_mods_source": "",  # a folder (a clone of your private mods repo) that Install herdr mods copies from; set only from the web UI
-    "use_herdr": True,  # an agent peerlink starts (always in a herdr core terminal) also opens as a tab in the herdr app; off, it runs unshown (hc attach)  # hours no worker is started, like "22-8"; empty is off; set only from the web UI
+    "use_herdr": True,  # peerlink uses the herdr app: an agent it starts (always in a herdr core terminal) also opens as a tab there, and herdr sync can run; off, neither (hc attach)  # hours no worker is started, like "22-8"; empty is off; set only from the web UI
     "task_nudge_h": 24,  # an open task with no update for this many hours is raised with its owner, then with whoever asked; 0 is off
     "ask_defaults": True,  # a question to you may name a default the agent goes with when you haven't answered in time
     "ask_default_min_m": 10,  # the shortest wait, in minutes, an agent may give you before its default applies
@@ -5523,7 +5523,10 @@ def request_spawn(body):
     if auto:
         decide_spawn(sp["id"], True, "auto-approve")
         if channel and chat_ready(channel):
-            post_async([(channel, f"**{sp['requester']['name']}** {'queued' if sp['status'] == 'queued' else 'started'} {sp['name'] or folder_name(folder)}", None)])
+            what = sp["name"] or folder_name(folder)
+            done = (f"queued {what}" if sp["status"] == "queued" else f"started {what}" if sp["status"] == "started"
+                    else f"couldn't start {what}: {sp.get('note') or sp['status']}")
+            post_async([(channel, f"**{sp['requester']['name']}** {done}", None)])
         return 200, {"id": sp["id"], "status": sp["status"], "note": f" Auto-approved: {sp['note']}{launch_note(sp)}", **launch_opts(sp)}
     if channel and chat_ready(channel):
         try:
@@ -5611,13 +5614,28 @@ HC_INSTALL = ('powershell -c "irm https://releases.herdr.dev/core/install.ps1 | 
 def find_hc():
     """herdr core's hc, which runs programs in terminals that outlive whoever started them (the herdr app shows them);
     '' when it isn't installed. Its installer names it herdr-core and adds hc beside it only when no other hc is
-    there (some window managers have one), so herdr-core comes first."""
-    dirs = (os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin", "/usr/local/bin")
+    there (some window managers have one), so herdr-core comes first, wherever it is, before any hc. The installer's
+    folder is looked in too: a daemon started before the install has the PATH it had then (on Windows the installer
+    adds its folder to the user PATH, which running programs don't see)."""
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA", "")
+        dirs, ext = (os.environ.get("HC_INSTALL_DIR", ""), os.path.join(local, "Programs", "herdr-core") if local else ""), ".exe"
+    else:
+        dirs, ext = (os.environ.get("HC_INSTALL_DIR", ""), os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin", "/usr/local/bin"), ""
     for name in ("herdr-core", "hc"):
-        found = shutil.which(name) or next((p for p in (os.path.join(d, name) for d in dirs) if os.access(p, os.X_OK)), "")
+        found = shutil.which(name) or next((p for p in (os.path.join(d, name + ext) for d in dirs if d)
+                                            if os.path.isfile(p) and os.access(p, os.X_OK)), "")
         if found:
             return found
     return ""
+
+
+def hc_cmd(hc):
+    """The command you type for herdr core: hc where that's it, else herdr-core (another program has the name hc)."""
+    other = shutil.which("hc")
+    if other and os.path.realpath(other) == os.path.realpath(hc):
+        return "hc"
+    return os.path.splitext(os.path.basename(hc))[0] or "hc"
 
 
 def hc_screen(hc, address):
@@ -6047,11 +6065,14 @@ def launch_hc(hc, claude, sp):
     its space gets its space's lead's terminal as parent, so herdr nests it under the lead (a worker whose space has no
     running lead, under whoever hired it); the lead itself has no parent. With use_herdr on, a hire also opens as a
     tab in its asker's herdr app space."""
-    if sp.get("hc") and hc_pid(sp["hc"]):
-        # One started for this before is still there: its agent hasn't registered yet, so don't start a second.
+    cmd = hc_cmd(hc)
+    earlier = hc_terminal(sp["hc"]) if sp.get("hc") else {}
+    # One started for this before (a schedule's last run) is still there, and its agent hasn't registered yet: don't
+    # start a second. hc hands an ended terminal's address to the next one, so only one still labelled for it counts.
+    if earlier.get("state") == "live" and (earlier.get("labels") or {}).get("peerlink.spawn") == sp["id"]:
         if "trust this folder" in hc_screen(hc, sp["hc"]):
-            return "", f'Claude Code there is waiting for you to trust the folder: run hc attach {sp["hc"]} and choose "Yes, I trust this folder"'
-        return f"still starting (hc attach {sp['hc']})", ""
+            return "", f'Claude Code there is waiting for you to trust the folder: run {cmd} attach {sp["hc"]} and choose "Yes, I trust this folder"'
+        return f"still starting ({cmd} attach {sp['hc']})", ""
     name = re.sub(r"[^a-z0-9_-]", "-", (sp.get("name") or os.path.basename(sp["dir"])).lower())[:24].strip("-") + "-" + sp["id"]
     asker = sp.get("requester") or {}
     with lock:
@@ -6075,7 +6096,11 @@ def launch_hc(hc, claude, sp):
     argv += claude_argv(claude, launch_args(sp))
     r = subprocess.run(argv, timeout=20, capture_output=True, text=True)
     if r.returncode != 0:
-        return "", "hc couldn't start it: " + ((r.stderr or r.stdout).strip()[:300] or f"it exited with {r.returncode}")
+        why = (r.stderr or r.stdout).strip()[:300] or f"it exited with {r.returncode}"
+        if os.path.splitext(os.path.basename(os.path.realpath(hc)))[0] != "herdr-core":
+            # A bare hc may be another program (some window managers have one), not herdr core.
+            why += f". If {hc} isn't herdr core, install herdr core with: {HC_INSTALL}"
+        return "", "hc couldn't start it: " + why
     try:
         out = json.loads(r.stdout)
         address = out.get("address") or (out.get("terminal") or {}).get("address") or ""
@@ -6084,8 +6109,8 @@ def launch_hc(hc, claude, sp):
     sp["hc"] = address or name[:32]
     if tab:
         threading.Thread(target=name_herdr_tab, args=(tab, sp.get("name") or os.path.basename(sp["dir"])), daemon=True).start()
-        return f"in the herdr app (hc attach {sp['hc']})", ""
-    return f"in a herdr core terminal (hc attach {sp['hc']})", ""
+        return f"in the herdr app ({cmd} attach {sp['hc']})", ""
+    return f"in a herdr core terminal ({cmd} attach {sp['hc']})", ""
 
 
 def launch(sp):
@@ -6575,8 +6600,13 @@ def fire_schedule(c, now):
 
 
 def start_for_schedule(c):
-    how, err = launch({"dir": c["folder"], "id": c["id"]})
+    # The terminal an earlier run started goes along: while its agent is still starting (or waiting for you to trust
+    # the folder), launch says so rather than start a second one.
+    sp = {"dir": c["folder"], "id": c["id"], "hc": c.get("hc") or ""}
+    how, err = launch(sp)
     with lock:
+        if sp.get("hc"):
+            c["hc"] = sp["hc"]
         who = c.get("agent") or "an agent"
         c["note"] = f"couldn't start {who}: {err}" if err else f"{who} is {how}" if how.startswith("still") else f"started {who} {how}"
         if err:
