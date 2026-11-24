@@ -540,6 +540,34 @@ class HerdrLaunchTest(unittest.TestCase):
                 d.start_for_schedule(c)
             self.assertEqual(d.name_claims["/x/api"], [])
 
+    def test_a_schedules_agent_missed_after_a_wake_isnt_started_twice(self):
+        c = {"id": "c3", "folder": "/x/api", "agent": "alex", "cron": "0 * * * *", "prompt": "Check the queue.", "start": True,
+             "requester": {"cwd": "/x/lead"}}
+        live, runs = {}, []
+        self.addCleanup(d.name_claims.pop, "/x/api", None)
+        self.addCleanup(d.sessions.pop, "s-alex", None)
+        self.addCleanup(d.starting.pop, "/x/api", None)
+        with unittest.mock.patch.object(d, "find_claude", lambda: "/bin/claude"), unittest.mock.patch.object(d, "find_hc", lambda: "/bin/hc"), \
+                unittest.mock.patch.object(d.subprocess, "run", self.schedule_hc(live, runs, screen="> ")), \
+                unittest.mock.patch.object(d, "save_schedules", lambda: None), unittest.mock.patch.object(d, "schedule_told", lambda c, t: None), \
+                unittest.mock.patch.object(d, "record", lambda m: None):
+            d.start_for_schedule(c)
+            # Its agent came up from t1, and the next run finds it there.
+            d.sessions["s-alex"] = {"id": "s-alex", "name": "alex", "cwd": "/x/api", "terminal": "hc:t1@1", "last_seen": time.time()}
+            with d.lock:
+                self.assertIsNone(d.fire_schedule(c, time.time()))
+            self.assertEqual(c["hc"], "t1")  # kept: the agent may not be found next time while t1 still runs it
+            # The machine slept: alex's heartbeat is late, and the next run finds no alex, though t1 still runs it.
+            d.sessions["s-alex"]["last_seen"] = time.time() - 3600
+            d.starting.pop("/x/api", None)
+            with d.lock:
+                self.assertIs(d.fire_schedule(c, time.time()), c)
+            d.start_for_schedule(c)
+        self.assertEqual(len(runs), 1, c["note"])
+        self.assertEqual(c["note"], "alex is still starting (hc attach t1)")
+        d.inboxes.pop("agent:alex", None)
+        d.inboxes.pop("s-alex", None)
+
     def test_a_terminal_whose_agent_came_up_or_in_another_folder_doesnt_hold_a_start_back(self):
         for why in ("its agent came up", "the schedule now points at another folder"):
             with self.subTest(why):

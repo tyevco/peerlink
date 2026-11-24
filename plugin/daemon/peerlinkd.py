@@ -6576,7 +6576,6 @@ def fire_schedule(c, now):
         msg["to_cwd"] = ""
     if own:
         c["folder"] = own.get("cwd") or c["folder"]  # where to start it next time it isn't running
-        c.pop("hc", None)  # an earlier run's terminal, if any, has brought its agent up
         msg["to"], msg["to_name"] = own["id"], display_name(own)
         inboxes.setdefault(own["id"], []).append(msg)
         record(msg)
