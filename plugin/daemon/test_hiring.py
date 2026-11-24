@@ -262,6 +262,10 @@ class HerdrLaunchTest(unittest.TestCase):
             p = unittest.mock.patch.object(d, target, fake)
             p.start()
             self.addCleanup(p.stop)
+        # The settings a running daemon has (peer_ttl_s and so on), where no other test loaded them.
+        p = unittest.mock.patch.dict(d.config, {k: v for k, v in d.DEFAULT_CONFIG.items() if k not in d.config})
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_claude_starts_through_your_shell_when_you_have_an_alias_for_it(self):
         def run_with(out):
@@ -402,9 +406,11 @@ class HerdrLaunchTest(unittest.TestCase):
         def run(argv, **kw):
             seen.append(argv)
             return unittest.mock.Mock(returncode=1, stdout="", stderr="no server")
-        for hc, hint in (("/bin/herdr-core", False), ("/bin/hc", True)):  # a bare hc may be another program
+        links = {"/u/.local/bin/hc": "/u/.local/bin/herdr-core"}  # the installer's hc, a link to herdr-core
+        for hc, hint in (("/u/.local/bin/herdr-core", False), ("/u/.local/bin/hc", False), ("/usr/bin/hc", True)):  # a bare hc may be another program
             with self.subTest(hc=hc), unittest.mock.patch.object(d, "find_claude", lambda: "/bin/claude"), \
-                    unittest.mock.patch.object(d, "find_hc", lambda: hc), unittest.mock.patch.object(d.subprocess, "run", run):
+                    unittest.mock.patch.object(d, "find_hc", lambda: hc), unittest.mock.patch.object(d.subprocess, "run", run), \
+                    unittest.mock.patch.object(d.os.path, "realpath", lambda p: links.get(p, p)):
                 seen.clear()
                 how, err = d.launch(sp)
                 self.assertEqual(how, "")
@@ -501,6 +507,60 @@ class HerdrLaunchTest(unittest.TestCase):
             d.start_for_schedule(c)
             self.assertEqual(len(runs), 2)
 
+    def schedule_hc(self, live, runs, screen="Do you trust this folder?\n > 1. Yes, I trust this folder\n"):
+        """A fake hc for schedule starts: run makes t1, t2, ...; get says what `live` holds; read shows `screen`."""
+        def run(argv, **kw):
+            if argv[1] == "run":
+                runs.append(argv)
+                addr = f"t{len(runs)}"
+                live[addr] = {"state": "live", "cwd": argv[argv.index("--cwd") + 1], "foreground": {"pid": 11},
+                              "labels": {"peerlink.spawn": argv[argv.index("--label") + 1].split("=", 1)[1]}}
+                return unittest.mock.Mock(returncode=0, stdout=json.dumps({"address": addr}), stderr="")
+            if argv[1] == "get":
+                return unittest.mock.Mock(returncode=0 if argv[2] in live else 1, stdout=json.dumps(live.get(argv[2], {})), stderr="")
+            return unittest.mock.Mock(returncode=0, stdout=screen, stderr="")
+        return run
+
+    def test_a_schedules_agent_still_waiting_for_trust_keeps_its_name(self):
+        c = {"id": "c3", "folder": "/x/api", "agent": "alex", "requester": {"cwd": "/x/lead"}}
+        live, runs, told = {}, [], []
+        self.addCleanup(d.name_claims.pop, "/x/api", None)
+        with unittest.mock.patch.object(d, "find_claude", lambda: "/bin/claude"), unittest.mock.patch.object(d, "find_hc", lambda: "/bin/hc"), \
+                unittest.mock.patch.object(d.subprocess, "run", self.schedule_hc(live, runs)), \
+                unittest.mock.patch.object(d, "save_schedules", lambda: None), unittest.mock.patch.object(d, "schedule_told", lambda c, t: told.append(t)):
+            d.name_claims["/x/api"] = ["alex"]  # fire_schedule's claim, for the agent this starts
+            d.start_for_schedule(c)
+            d.start_for_schedule(c)  # the next run: it's at the trust prompt
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(d.name_claims["/x/api"], ["alex"])  # it still comes up as alex once you trust the folder
+            self.assertTrue(c["note"].startswith("alex hasn't come up: Claude Code there is waiting for you to trust the folder"), c["note"])
+            self.assertIn("the agent it started in /x/api hasn't come up", told[0])
+            live.clear()
+            with unittest.mock.patch.object(d, "find_hc", lambda: ""):  # one that couldn't start at all gives the name up
+                d.start_for_schedule(c)
+            self.assertEqual(d.name_claims["/x/api"], [])
+
+    def test_a_terminal_whose_agent_came_up_or_in_another_folder_doesnt_hold_a_start_back(self):
+        for why in ("its agent came up", "the schedule now points at another folder"):
+            with self.subTest(why):
+                c = {"id": "c3", "folder": "/x/api", "agent": "", "requester": {"cwd": "/x/lead"}}
+                live, runs = {}, []
+                with unittest.mock.patch.object(d, "find_claude", lambda: "/bin/claude"), unittest.mock.patch.object(d, "find_hc", lambda: "/bin/hc"), \
+                        unittest.mock.patch.object(d.subprocess, "run", self.schedule_hc(live, runs, screen="> ")), \
+                        unittest.mock.patch.object(d, "save_schedules", lambda: None), unittest.mock.patch.object(d, "schedule_told", lambda c, t: None):
+                    d.start_for_schedule(c)
+                    if why == "its agent came up":
+                        # It registered from t1 (and goes by another name now, so the schedule didn't find it).
+                        d.sessions["s-t1"] = {"id": "s-t1", "name": "api-2", "cwd": "/x/api", "terminal": "hc:t1@10", "last_seen": time.time()}
+                    else:
+                        c["folder"] = "/x/web"
+                    try:
+                        d.start_for_schedule(c)
+                    finally:
+                        d.sessions.pop("s-t1", None)
+                self.assertEqual(len(runs), 2, c["note"])
+                self.assertEqual(c["hc"], "t2")
+
     @unittest.skipIf(os.name == "nt", "the folders looked in differ on Windows")
     def test_herdr_core_is_found_by_its_installed_name_before_any_other_hc(self):
         local = os.path.join(os.path.expanduser("~/.local/bin"), "herdr-core")
@@ -519,11 +579,13 @@ class HerdrLaunchTest(unittest.TestCase):
                 self.assertEqual(d.find_hc(), want)
 
     def test_the_attach_command_is_the_one_you_can_type(self):
-        for why, on_path, hc, want in (("hc is herdr core", "/u/.local/bin/herdr-core", "/u/.local/bin/herdr-core", "hc"),
+        links = {"/u/.local/bin/hc": "/u/.local/bin/herdr-core"}  # the installer's hc, a link to herdr-core
+        for why, on_path, hc, want in (("hc is herdr core (a link to it)", "/u/.local/bin/hc", "/u/.local/bin/herdr-core", "hc"),
                                        ("hc is another program", "/usr/bin/hc", "/u/.local/bin/herdr-core", "herdr-core"),
                                        ("no hc", None, "/u/.local/bin/herdr-core", "herdr-core"),
                                        ("only an hc", "/opt/bin/hc", "/opt/bin/hc", "hc")):
-            with self.subTest(why), unittest.mock.patch.object(d.shutil, "which", lambda n: on_path if n == "hc" else None):
+            with self.subTest(why), unittest.mock.patch.object(d.shutil, "which", lambda n: on_path if n == "hc" else None), \
+                    unittest.mock.patch.object(d.os.path, "realpath", lambda p: links.get(p, p)):
                 self.assertEqual(d.hc_cmd(hc), want)
 
 if __name__ == "__main__":

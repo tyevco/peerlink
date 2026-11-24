@@ -6067,9 +6067,15 @@ def launch_hc(hc, claude, sp):
     tab in its asker's herdr app space."""
     cmd = hc_cmd(hc)
     earlier = hc_terminal(sp["hc"]) if sp.get("hc") else {}
-    # One started for this before (a schedule's last run) is still there, and its agent hasn't registered yet: don't
-    # start a second. hc hands an ended terminal's address to the next one, so only one still labelled for it counts.
-    if earlier.get("state") == "live" and (earlier.get("labels") or {}).get("peerlink.spawn") == sp["id"]:
+    with lock:
+        # Its agent came up (and may go by another name now, or the schedule points elsewhere): it isn't starting.
+        came_up = bool(earlier) and any(herdr_sync.hc_address(r.get("terminal") or "") == sp["hc"] and is_live(r) for r in sessions.values())
+    # One started for this before (a schedule's last run) is still there in this folder, and its agent hasn't
+    # registered yet: don't start a second. hc hands an ended terminal's address to the next one, so only one still
+    # labelled for it counts.
+    if (not came_up and earlier.get("state") == "live" and earlier.get("cwd") in (None, "", sp["dir"])
+            and (earlier.get("labels") or {}).get("peerlink.spawn") == sp["id"]):
+        sp["waiting"] = True  # started already: what its agent needs when it registers (a name claim) stays
         if "trust this folder" in hc_screen(hc, sp["hc"]):
             return "", f'Claude Code there is waiting for you to trust the folder: run {cmd} attach {sp["hc"]} and choose "Yes, I trust this folder"'
         return f"still starting ({cmd} attach {sp['hc']})", ""
@@ -6570,6 +6576,7 @@ def fire_schedule(c, now):
         msg["to_cwd"] = ""
     if own:
         c["folder"] = own.get("cwd") or c["folder"]  # where to start it next time it isn't running
+        c.pop("hc", None)  # an earlier run's terminal, if any, has brought its agent up
         msg["to"], msg["to_name"] = own["id"], display_name(own)
         inboxes.setdefault(own["id"], []).append(msg)
         record(msg)
@@ -6608,13 +6615,17 @@ def start_for_schedule(c):
         if sp.get("hc"):
             c["hc"] = sp["hc"]
         who = c.get("agent") or "an agent"
-        c["note"] = f"couldn't start {who}: {err}" if err else f"{who} is {how}" if how.startswith("still") else f"started {who} {how}"
+        c["note"] = (f"{who} hasn't come up: {err}" if err and sp.get("waiting") else f"couldn't start {who}: {err}" if err
+                     else f"{who} is {how}" if how.startswith("still") else f"started {who} {how}")
         if err:
-            if c.get("agent") and c["agent"] in name_claims.get(c["folder"], []):
+            # The agent an earlier run started is still to register: it takes the name when it does.
+            if c.get("agent") and not sp.get("waiting") and c["agent"] in name_claims.get(c["folder"], []):
                 name_claims[c["folder"]].remove(c["agent"])
             # Said once: the same failure on every run is noise until it changes or a start goes through.
             if err != c.get("start_err"):
-                schedule_told(c, f"Schedule {c['id']} ran, but no agent was running in {tilde_path(c['folder'])} and one couldn't start: {err}. The prompt waits there for an hour.")
+                schedule_told(c, f"Schedule {c['id']} ran, but the agent it started in {tilde_path(c['folder'])} hasn't come up: {err}. The prompt waits there for an hour."
+                              if sp.get("waiting") else
+                              f"Schedule {c['id']} ran, but no agent was running in {tilde_path(c['folder'])} and one couldn't start: {err}. The prompt waits there for an hour.")
         c["start_err"] = err
         save_schedules()
     log("schedule", c["id"], c["note"])
