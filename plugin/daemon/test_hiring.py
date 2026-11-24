@@ -1,5 +1,5 @@
 """Tests for hiring workers: the worker flag and its limits, retire, the cap and its queue, the night guard, and
-starting agents in herdr's terminals. Run: python3 -m unittest discover -s plugin/daemon"""
+starting agents in herdr core's terminals. Run: python3 -m unittest discover -s plugin/daemon"""
 import copy
 import json
 import os
@@ -273,7 +273,7 @@ class HerdrLaunchTest(unittest.TestCase):
         with unittest.mock.patch.object(d, "find_claude", lambda: "/bin/claude"), unittest.mock.patch.object(d, "find_hc", lambda: "/bin/hc"), \
                 unittest.mock.patch.object(d.subprocess, "run", run):
             how, err = d.launch(sp)
-            self.assertEqual((how, err, sp["hc"]), ("in the herdr app (hc attach t42)", "", "t42"))
+            self.assertEqual((how, err, sp["hc"]), ("in a herdr core terminal (hc attach t42)", "", "t42"))
             self.assertEqual(d.hc_pid("t42"), 11)
         argv = calls[0]
         for flag in ("--bg", "--no-parent", "--outlive-parent", "--rm"):
@@ -307,6 +307,27 @@ class HerdrLaunchTest(unittest.TestCase):
         self.assertIn("herdr.space=sp-lead", argv)
         self.assertTrue(any(a.startswith("herdr.tab=tb") for a in argv))  # its own tab, named after it
         self.assertEqual(argv[-1], "/bin/claude")
+
+    def test_with_the_herdr_app_off_a_hire_runs_in_herdr_core_unshown(self):
+        d.sessions["s-lead9"] = {"id": "s-lead9", "name": "lead9", "cwd": "/x/lead9", "pid": 77, "last_seen": time.time()}
+        self.addCleanup(d.sessions.pop, "s-lead9", None)
+        sp = {"id": "s9", "dir": "/x/api", "name": "pg-client", "space": "pixelgrid", "requester": {"id": "s-lead9", "cwd": "/x/lead9"}}
+        calls = []
+
+        def run(argv, **kw):
+            calls.append(argv)
+            out = ({"terminals": [{"address": "t2", "cwd": "/x/lead9", "state": "live"}]} if argv[1] == "ls"
+                   else {"state": "live", "labels": {"herdr.space": "sp-lead"}, "foreground": {"pid": 77}} if argv[1] == "get"
+                   else {"address": "t42"})
+            return unittest.mock.Mock(returncode=0, stdout=json.dumps(out), stderr="")
+        with unittest.mock.patch.dict(d.config, {"use_herdr": False}), unittest.mock.patch.object(d, "find_claude", lambda: "/bin/claude"), \
+                unittest.mock.patch.object(d, "find_hc", lambda: "/bin/hc"), unittest.mock.patch.object(d.subprocess, "run", run):
+            how, err = d.launch(sp)
+        self.assertEqual((how, err), ("in a herdr core terminal (hc attach t42)", ""))
+        argv = next(a for a in calls if a[1] == "run")
+        self.assertFalse(any(a.startswith(("herdr.space=", "herdr.tab=")) for a in argv), argv)
+        self.assertIn("peerlink.spawn=s9", argv)
+        self.assertNotIn("ls", [a[1] for a in calls])  # the app's spaces aren't even looked up
 
     def test_a_worker_nests_under_its_leads_terminal(self):
         d.sessions["s-lead9"] = {"id": "s-lead9", "name": "lead9", "cwd": "/x/lead9", "pid": 77, "terminal": "hc:t2@50",
@@ -362,38 +383,74 @@ class HerdrLaunchTest(unittest.TestCase):
                 argv = next(a for a in calls if a[1] == "run")
                 self.assertEqual(argv[argv.index("--parent") + 1] if "--parent" in argv else "", parent)
 
-    def test_when_hc_fails_it_falls_back_to_tmux(self):
+    def test_when_hc_fails_the_agent_doesnt_start_and_says_why(self):
         sp = {"id": "s9", "dir": "/x/api", "name": "", "space": ""}
         seen = []
 
         def run(argv, **kw):
-            seen.append(os.path.basename(argv[0]))
-            if argv[0] == "/bin/hc":
-                return unittest.mock.Mock(returncode=1, stdout="", stderr="no server")
-            return unittest.mock.Mock(returncode=1 if "has-session" in argv else 0, stdout="", stderr="")
+            seen.append(argv)
+            return unittest.mock.Mock(returncode=1, stdout="", stderr="no server")
         with unittest.mock.patch.object(d, "find_claude", lambda: "/bin/claude"), unittest.mock.patch.object(d, "find_hc", lambda: "/bin/hc"), \
-                unittest.mock.patch.object(d.shutil, "which", lambda n: "/bin/tmux" if n == "tmux" else None), \
                 unittest.mock.patch.object(d.subprocess, "run", run):
             how, err = d.launch(sp)
-        self.assertEqual(err, "")
-        self.assertTrue(how.startswith("in tmux"), how)
-        self.assertEqual(seen[0], "hc")
+        self.assertEqual((how, err), ("", "hc couldn't start it: no server"))
+        self.assertEqual({a[0] for a in seen}, {"/bin/hc"})  # nothing else is tried: no tmux, no Terminal window
+        self.assertNotIn("hc", sp)
 
-    def test_with_herdr_turned_off_hc_is_never_tried(self):
+    def test_without_herdr_core_starting_an_agent_says_how_to_get_it(self):
+        sp = {"id": "s9", "dir": "/x/api", "name": "", "space": ""}
+        with unittest.mock.patch.object(d, "find_claude", lambda: "/bin/claude"), unittest.mock.patch.object(d, "find_hc", lambda: ""), \
+                unittest.mock.patch.object(d.subprocess, "run", lambda *a, **kw: self.fail("nothing runs without hc")):
+            how, err = d.launch(sp)
+        self.assertEqual(how, "")
+        self.assertIn("needs herdr core (hc)", err)
+        self.assertIn(d.HC_INSTALL, err)
+        self.assertIn("releases.herdr.dev/core/install", d.HC_INSTALL)
+
+    def test_with_the_herdr_app_off_hc_still_starts_agents(self):
         sp = {"id": "s9", "dir": "/x/api", "name": "", "space": ""}
         seen = []
 
         def run(argv, **kw):
-            seen.append(os.path.basename(argv[0]))
-            return unittest.mock.Mock(returncode=1 if "has-session" in argv else 0, stdout="", stderr="")
+            seen.append(argv)
+            return unittest.mock.Mock(returncode=0, stdout=json.dumps({"address": "t7"}), stderr="")
         with unittest.mock.patch.dict(d.config, {"use_herdr": False}), unittest.mock.patch.object(d, "find_claude", lambda: "/bin/claude"), \
-                unittest.mock.patch.object(d, "find_hc", lambda: "/bin/hc"), \
-                unittest.mock.patch.object(d.shutil, "which", lambda n: "/bin/tmux" if n == "tmux" else None), \
-                unittest.mock.patch.object(d.subprocess, "run", run):
+                unittest.mock.patch.object(d, "find_hc", lambda: "/bin/hc"), unittest.mock.patch.object(d.subprocess, "run", run):
             how, err = d.launch(sp)
-        self.assertTrue(how.startswith("in tmux"), how)
-        self.assertNotIn("hc", seen)
+        self.assertEqual((how, err), ("in a herdr core terminal (hc attach t7)", ""))
+        self.assertEqual(seen[0][:2], ["/bin/hc", "run"])
 
+    def test_one_started_before_is_left_running_and_a_trust_prompt_there_is_said(self):
+        for screen, want in (("Claude Code\n\nDo you trust this folder?\n > 1. Yes, I trust this folder\n", ("", "trust")),
+                             ("Welcome back\n> ", ("still starting (hc attach t42)", ""))):
+            with self.subTest(screen=screen[:12]):
+                sp = {"id": "s9", "dir": "/x/api", "name": "", "space": "", "hc": "t42"}
+                seen = []
+
+                def run(argv, **kw):
+                    seen.append(argv[1])
+                    if argv[1] == "get":
+                        return unittest.mock.Mock(returncode=0, stdout=json.dumps({"state": "live", "foreground": {"pid": 11}}), stderr="")
+                    if argv[1] == "read":
+                        return unittest.mock.Mock(returncode=0, stdout=screen, stderr="")
+                    self.fail(f"a second agent was started: {argv}")
+                with unittest.mock.patch.object(d, "find_claude", lambda: "/bin/claude"), unittest.mock.patch.object(d, "find_hc", lambda: "/bin/hc"), \
+                        unittest.mock.patch.object(d.subprocess, "run", run):
+                    how, err = d.launch(sp)
+                self.assertEqual(how, want[0])
+                if want[1]:
+                    self.assertIn("trust the folder: run hc attach t42", err)
+                else:
+                    self.assertEqual(err, "")
+                self.assertIn("read", seen)
+
+    def test_herdr_core_is_found_by_its_installed_name_before_any_other_hc(self):
+        found = {"herdr-core": "/u/.local/bin/herdr-core", "hc": "/usr/bin/hc"}
+        cases = ((found, "/u/.local/bin/herdr-core"), ({"hc": "/usr/bin/hc"}, "/usr/bin/hc"), ({}, ""))
+        for on_path, want in cases:
+            with self.subTest(on_path=sorted(on_path)), unittest.mock.patch.object(d.shutil, "which", lambda n: on_path.get(n)), \
+                    unittest.mock.patch.object(d.os, "access", lambda p, m: False):
+                self.assertEqual(d.find_hc(), want)
 
 if __name__ == "__main__":
     unittest.main()

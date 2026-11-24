@@ -44,7 +44,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) first: layout, tests, rules for changes.
 
 ## herdr
 
-- peerlink must never require herdr. The `hc` launcher is used only when herdr is installed and `use_herdr` is on.
+- peerlink must never require the herdr app. Only starting agents needs herdr core (`hc`, installed as `herdr-core`); there's no tmux or Terminal.app fallback, and everything else runs without it. `use_herdr` only decides whether a started agent also opens as a tab in the herdr app.
 - peerlink's own herdr-app panels (`peerlink-spaces`, `peerlink-agents`) are generated from `plugin/daemon/herdr_mod.py`. A new release overwrites any live-patched copy in `~/.config/herdr-app/mods/`. herdr-app keeps the agents-list sort in memory, so editing `shared.json` while it runs has no effect. A `turn.step` hook must be an `async function*`.
 - Restart an agent in its herdr pane: SIGTERM its `claude` process, then `hc send <terminal> ...` with `HC_TERMINAL_ID` unset.
 - The user's other herdr mods live in [herdr-mods](https://github.com/dfunq/herdr-mods), which has its own release flow (see its CLAUDE.md).
