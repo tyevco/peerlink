@@ -19,7 +19,7 @@ Security problems go through [SECURITY.md](SECURITY.md), not public issues.
 
 ## Setting up
 
-You need Claude Code, `python3` on your `PATH`, and git. tmux is optional; with it, started agents run in tmux sessions.
+You need Claude Code, `python3` on your `PATH`, and git. [herdr core](https://herdr.dev/core/) (`hc`) is optional: peerlink needs it only to start agents (`request_spawn`, schedules), which run in its terminals.
 
 ```
 git clone https://github.com/dfunq/peerlink

@@ -210,7 +210,7 @@ DEFAULT_CONFIG = {
     "herdr_tab_names": {},  # herdr tab id -> the name herdr sync last left it showing: a tab renamed since renames its agent
     "herdr_join_never": "",  # spaces a tab you open in herdr never joins on its own, comma separated (a space others nest in never does either); agents can add to it, only the web UI removes
     "herdr_mods_source": "",  # a folder (a clone of your private mods repo) that Install herdr mods copies from; set only from the web UI
-    "use_herdr": True,  # start agents in herdr's terminals when herdr (hc) is installed; off, or without herdr, tmux or Terminal as before  # hours no worker is started, like "22-8"; empty is off; set only from the web UI
+    "use_herdr": True,  # peerlink uses the herdr app: an agent it starts (always in a herdr core terminal) also opens as a tab there, and herdr sync can run; off, neither (hc attach)  # hours no worker is started, like "22-8"; empty is off; set only from the web UI
     "task_nudge_h": 24,  # an open task with no update for this many hours is raised with its owner, then with whoever asked; 0 is off
     "ask_defaults": True,  # a question to you may name a default the agent goes with when you haven't answered in time
     "ask_default_min_m": 10,  # the shortest wait, in minutes, an agent may give you before its default applies
@@ -4411,16 +4411,6 @@ def successor(cwd):
     return max(named or live, key=lambda r: r["last_seen"]) if live else None
 
 
-def tmux_pane_pid(name):
-    """The process a tmux session the daemon started runs, 0 when it's gone."""
-    tmux = shutil.which("tmux") or next((p for p in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux") if os.access(p, os.X_OK)), "")
-    try:
-        out = subprocess.run([tmux, "list-panes", "-t", f"={name}:", "-F", "#{pane_pid}"], timeout=5, capture_output=True, text=True).stdout
-        return int(out.split()[0]) if out.split() else 0
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return 0
-
-
 def windows_parents():
     """Each running process's parent on Windows, {pid: parent pid}, from one process snapshot; {} when it can't be
     taken. ps there is Git Bash's, which has no -o and numbers processes its own way."""
@@ -4475,12 +4465,12 @@ def descends_from(pid, ancestor):
 
 
 def spawn_of(rec, fresh):
-    """The started spawn this newly registering agent is the one for: the spawn whose tmux pane it runs under, else
-    (no pane to go by) the oldest unclaimed one in its folder when rec is a new conversation. None for any other."""
+    """The started spawn this newly registering agent is the one for: the spawn whose hc terminal it runs under, else
+    (no live terminal to go by) the oldest unclaimed one in its folder when rec is a new conversation. None for any other."""
     cands = [sp for sp in spawns.values() if sp["status"] == "started" and not sp.get("agent_id") and sp["dir"] == rec.get("cwd")
              and time.time() - sp["updated"] < 86400]
     for sp in sorted(cands, key=lambda x: x["updated"]):
-        pane = tmux_pane_pid(sp["tmux"]) if sp.get("tmux") else hc_pid(sp["hc"]) if sp.get("hc") else 0
+        pane = hc_pid(sp["hc"]) if sp.get("hc") else 0
         if (descends_from(rec.get("pid"), pane) if pane else fresh):
             return sp
     return None
@@ -4507,7 +4497,7 @@ def adopt(rec, old=None, spawn=None):
             # Held for an agent by name (a schedule's run): only that agent takes it, never another in its folder.
             box = list(inboxes[sid]) if sid == f"agent:{display_name(rec).lower()}" else []
         elif sid.startswith("spawn:"):
-            # A first prompt for the agent a spawn started: that one takes it, found by its tmux pane, else the first
+            # A first prompt for the agent a spawn started: that one takes it, found by its hc terminal, else the first
             # new one in that folder.
             box = list(inboxes[sid]) if spawn and sid == f"spawn:{spawn['id']}" else []
         elif sid != old and agent_of.get(sid) in agents and agent_of[sid] != rec.get("agent") and other_agent_stays(agent_of[sid], rec):
@@ -5278,7 +5268,7 @@ def when_wait(s):
 
 
 # Starting an agent: an agent asks, you approve (web UI or Discord, never an agent or a bot), and only then
-# does the daemon start Claude Code in that folder, in tmux when it's there, else a Terminal window.
+# does the daemon start Claude Code in that folder, in a herdr core (hc) terminal.
 SPAWN_TTL_S = 24 * 3600
 
 
@@ -5533,7 +5523,10 @@ def request_spawn(body):
     if auto:
         decide_spawn(sp["id"], True, "auto-approve")
         if channel and chat_ready(channel):
-            post_async([(channel, f"**{sp['requester']['name']}** {'queued' if sp['status'] == 'queued' else 'started'} {sp['name'] or folder_name(folder)}", None)])
+            what = sp["name"] or folder_name(folder)
+            done = (f"queued {what}" if sp["status"] == "queued" else f"started {what}" if sp["status"] == "started"
+                    else f"couldn't start {what}: {sp.get('note') or sp['status']}")
+            post_async([(channel, f"**{sp['requester']['name']}** {done}", None)])
         return 200, {"id": sp["id"], "status": sp["status"], "note": f" Auto-approved: {sp['note']}{launch_note(sp)}", **launch_opts(sp)}
     if channel and chat_ready(channel):
         try:
@@ -5613,9 +5606,45 @@ def best_python():
     return best
 
 
+# How to get herdr core, said when an agent can't be started without it.
+HC_INSTALL = ('powershell -c "irm https://releases.herdr.dev/core/install.ps1 | iex"' if os.name == "nt"
+              else "curl -fsSL https://releases.herdr.dev/core/install.sh | sh")
+
+
 def find_hc():
-    """herdr's hc, which runs programs in terminals the herdr app shows; '' when it isn't installed."""
-    return shutil.which("hc") or next((p for p in (os.path.expanduser("~/.local/bin/hc"), "/opt/homebrew/bin/hc", "/usr/local/bin/hc") if os.access(p, os.X_OK)), "")
+    """herdr core's hc, which runs programs in terminals that outlive whoever started them (the herdr app shows them);
+    '' when it isn't installed. Its installer names it herdr-core and adds hc beside it only when no other hc is
+    there (some window managers have one), so herdr-core comes first, wherever it is, before any hc. The installer's
+    folder is looked in too: a daemon started before the install has the PATH it had then (on Windows the installer
+    adds its folder to the user PATH, which running programs don't see)."""
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA", "")
+        dirs, ext = (os.environ.get("HC_INSTALL_DIR", ""), os.path.join(local, "Programs", "herdr-core") if local else ""), ".exe"
+    else:
+        dirs, ext = (os.environ.get("HC_INSTALL_DIR", ""), os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin", "/usr/local/bin"), ""
+    for name in ("herdr-core", "hc"):
+        found = shutil.which(name) or next((p for p in (os.path.join(d, name + ext) for d in dirs if d)
+                                            if os.path.isfile(p) and os.access(p, os.X_OK)), "")
+        if found:
+            return found
+    return ""
+
+
+def hc_cmd(hc):
+    """The command you type for herdr core: hc where that's it, else herdr-core (another program has the name hc)."""
+    other = shutil.which("hc")
+    if other and os.path.realpath(other) == os.path.realpath(hc):
+        return "hc"
+    return os.path.splitext(os.path.basename(hc))[0] or "hc"
+
+
+def hc_screen(hc, address):
+    """The text on an hc terminal's screen now, '' when it's gone or hc can't say."""
+    try:
+        r = subprocess.run([hc, "read", address], timeout=10, capture_output=True, text=True)
+        return r.stdout if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def hc_terminal(address):
@@ -5771,7 +5800,7 @@ def herdr_sync_pass(apply=True):
 def herdr_sync_once(apply):
     hc = find_hc() if config.get("use_herdr", True) else ""
     if not hc:
-        return {"error": "herdr isn't installed, or starting agents in herdr is off"}
+        return {"error": "herdr core isn't installed, or showing agents in the herdr app is off"}
     got = herdr_sync_inputs(hc)
     if got is None:
         return {"error": "hc couldn't say what's in every terminal; nothing changed"}
@@ -6031,12 +6060,25 @@ def herdr_syncer():
 
 
 def launch_hc(hc, claude, sp):
-    """Start the agent in a herdr terminal: (how, "") or ("", why not). It outlives the terminal the daemon was
+    """Start the agent in a herdr core terminal: (how, "") or ("", why not). It outlives the terminal the daemon was
     started from, and is removed once it exits, so a retired agent's terminal doesn't linger. Any agent that won't lead
     its space gets its space's lead's terminal as parent, so herdr nests it under the lead (a worker whose space has no
-    running lead, under whoever hired it); the lead itself has no parent."""
-    if sp.get("hc") and hc_pid(sp["hc"]):
-        return f"still starting in the herdr app (hc attach {sp['hc']})", ""
+    running lead, under whoever hired it); the lead itself has no parent. With use_herdr on, a hire also opens as a
+    tab in its asker's herdr app space."""
+    cmd = hc_cmd(hc)
+    earlier = hc_terminal(sp["hc"]) if sp.get("hc") else {}
+    with lock:
+        # Its agent came up (and may go by another name now, or the schedule points elsewhere): it isn't starting.
+        came_up = bool(earlier) and any(herdr_sync.hc_address(r.get("terminal") or "") == sp["hc"] and is_live(r) for r in sessions.values())
+    # One started for this before (a schedule's last run) is still there in this folder, and its agent hasn't
+    # registered yet: don't start a second. hc hands an ended terminal's address to the next one, so only one still
+    # labelled for it counts.
+    if (not came_up and earlier.get("state") == "live" and earlier.get("cwd") in (None, "", sp["dir"])
+            and (earlier.get("labels") or {}).get("peerlink.spawn") == sp["id"]):
+        sp["waiting"] = True  # started already: what its agent needs when it registers (a name claim) stays
+        if "trust this folder" in hc_screen(hc, sp["hc"]):
+            return "", f'Claude Code there is waiting for you to trust the folder: run {cmd} attach {sp["hc"]} and choose "Yes, I trust this folder"'
+        return f"still starting ({cmd} attach {sp['hc']})", ""
     name = re.sub(r"[^a-z0-9_-]", "-", (sp.get("name") or os.path.basename(sp["dir"])).lower())[:24].strip("-") + "-" + sp["id"]
     asker = sp.get("requester") or {}
     with lock:
@@ -6051,7 +6093,7 @@ def launch_hc(hc, claude, sp):
             "--rm", "--cwd", sp["dir"], "--name", name[:32],
             "--label", f"peerlink.spawn={sp['id']}", "--label", f"peerlink.space={sp.get('space') or ''}"]
     # The herdr app shows a terminal only once it's in one of its spaces: a hire goes in its lead's, as a new tab.
-    space = hc_app_space(hc, asker.get("cwd") or "", pid) if asker.get("cwd") else ""
+    space = hc_app_space(hc, asker.get("cwd") or "", pid) if asker.get("cwd") and config.get("use_herdr", True) else ""
     tab = ""
     if space:
         # A tab id the app doesn't know yet becomes a new tab with that id, so it can be named after the agent.
@@ -6060,7 +6102,11 @@ def launch_hc(hc, claude, sp):
     argv += claude_argv(claude, launch_args(sp))
     r = subprocess.run(argv, timeout=20, capture_output=True, text=True)
     if r.returncode != 0:
-        return "", (r.stderr or r.stdout).strip()[:300] or f"hc exited with {r.returncode}"
+        why = (r.stderr or r.stdout).strip()[:300] or f"it exited with {r.returncode}"
+        if os.path.splitext(os.path.basename(os.path.realpath(hc)))[0] != "herdr-core":
+            # A bare hc may be another program (some window managers have one), not herdr core.
+            why += f". If {hc} isn't herdr core, install herdr core with: {HC_INSTALL}"
+        return "", "hc couldn't start it: " + why
     try:
         out = json.loads(r.stdout)
         address = out.get("address") or (out.get("terminal") or {}).get("address") or ""
@@ -6069,49 +6115,23 @@ def launch_hc(hc, claude, sp):
     sp["hc"] = address or name[:32]
     if tab:
         threading.Thread(target=name_herdr_tab, args=(tab, sp.get("name") or os.path.basename(sp["dir"])), daemon=True).start()
-    return f"in the herdr app (hc attach {sp['hc']})", ""
+        return f"in the herdr app ({cmd} attach {sp['hc']})", ""
+    return f"in a herdr core terminal ({cmd} attach {sp['hc']})", ""
 
 
 def launch(sp):
-    """Start Claude Code in the folder: (how, "") when it started, ("", why not) when it didn't. In a herdr terminal
-    when hc is installed, else tmux, else (on a Mac) a Terminal window."""
+    """Start Claude Code in the folder, in a herdr core terminal: (how, "") when it started, ("", why not) when it
+    didn't. Only starting agents needs herdr core; the rest of peerlink runs without it, and never needs the herdr app."""
     claude = find_claude()
     if not claude:
         return "", "Claude Code (claude) isn't on this machine's PATH"
-    # herdr is optional: used only when it's installed and not turned off; nothing else in peerlink needs it.
-    hc = find_hc() if config.get("use_herdr", True) else ""
-    if hc:
-        try:
-            how, err = launch_hc(hc, claude, sp)
-            if how:
-                return how, ""
-            log("spawn", sp["id"], "hc couldn't start it, trying tmux:", err)
-        except (OSError, subprocess.SubprocessError) as err:
-            log("spawn", sp["id"], "hc couldn't start it, trying tmux:", err)
-    tmux = shutil.which("tmux") or next((p for p in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux") if os.access(p, os.X_OK)), "")
+    hc = find_hc()
+    if not hc:
+        return "", f"starting an agent needs herdr core (hc) on this machine. Install it with: {HC_INSTALL}"
     try:
-        if tmux:
-            name = "peerlink-" + re.sub(r"[^A-Za-z0-9_-]", "-", os.path.basename(sp["dir"]))[:30] + "-" + sp["id"]
-            # One started for this before is still there: its agent hasn't registered yet, so don't start a second.
-            if subprocess.run([tmux, "has-session", "-t", "=" + name], timeout=10, capture_output=True).returncode == 0:
-                pane = subprocess.run([tmux, "capture-pane", "-p", "-t", f"={name}:"], timeout=10, capture_output=True, text=True).stdout
-                if "trust this folder" in pane:
-                    return "", f"Claude Code there is waiting for you to trust the folder: run tmux attach -t {name} and choose \"Yes, I trust this folder\""
-                return f"still starting in tmux (tmux attach -t {name})", ""
-            subprocess.run([tmux, "new-session", "-d", "-s", name, "-c", sp["dir"], *claude_argv(claude, launch_args(sp))], check=True, timeout=10, capture_output=True)
-            sp["tmux"] = name
-            return f"in tmux (tmux attach -t {name})", ""
-        if sys.platform == "darwin":
-            quote = lambda v: '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
-            # Terminal runs your shell, so an alias of yours named claude applies by itself.
-            shell = claude_argv(claude, launch_args(sp))
-            run = quote(shell[-1]) if shell[0] != claude else " & \" \" & ".join(f"quoted form of {quote(a)}" for a in shell)
-            script = f'tell application "Terminal" to do script "cd " & quoted form of {quote(sp["dir"])} & " && " & {run}'
-            subprocess.run(["osascript", "-e", script], check=True, timeout=15, capture_output=True)
-            return "in a new Terminal window", ""
+        return launch_hc(hc, claude, sp)
     except (OSError, subprocess.SubprocessError) as err:
-        return "", f"could not start it: {err}"
-    return "", "starting an agent needs tmux on this machine"
+        return "", f"hc couldn't start it: {err}"
 
 
 def start_spawn(sp, via):
@@ -6586,16 +6606,25 @@ def fire_schedule(c, now):
 
 
 def start_for_schedule(c):
-    how, err = launch({"dir": c["folder"], "id": c["id"]})
+    # The terminal an earlier run started goes along: while its agent is still starting (or waiting for you to trust
+    # the folder), launch says so rather than start a second one.
+    sp = {"dir": c["folder"], "id": c["id"], "hc": c.get("hc") or ""}
+    how, err = launch(sp)
     with lock:
+        if sp.get("hc"):
+            c["hc"] = sp["hc"]
         who = c.get("agent") or "an agent"
-        c["note"] = f"couldn't start {who}: {err}" if err else f"{who} is {how}" if how.startswith("still") else f"started {who} {how}"
+        c["note"] = (f"{who} hasn't come up: {err}" if err and sp.get("waiting") else f"couldn't start {who}: {err}" if err
+                     else f"{who} is {how}" if how.startswith("still") else f"started {who} {how}")
         if err:
-            if c.get("agent") and c["agent"] in name_claims.get(c["folder"], []):
+            # The agent an earlier run started is still to register: it takes the name when it does.
+            if c.get("agent") and not sp.get("waiting") and c["agent"] in name_claims.get(c["folder"], []):
                 name_claims[c["folder"]].remove(c["agent"])
             # Said once: the same failure on every run is noise until it changes or a start goes through.
             if err != c.get("start_err"):
-                schedule_told(c, f"Schedule {c['id']} ran, but no agent was running in {tilde_path(c['folder'])} and one couldn't start: {err}. The prompt waits there for an hour.")
+                schedule_told(c, f"Schedule {c['id']} ran, but the agent it started in {tilde_path(c['folder'])} hasn't come up: {err}. The prompt waits there for an hour."
+                              if sp.get("waiting") else
+                              f"Schedule {c['id']} ran, but no agent was running in {tilde_path(c['folder'])} and one couldn't start: {err}. The prompt waits there for an hour.")
         c["start_err"] = err
         save_schedules()
     log("schedule", c["id"], c["note"])

@@ -537,7 +537,7 @@ class SpawnToldTest(unittest.TestCase):
         peerlinkd.config["folder_names"] = {**keep[0], folder: os.path.basename(folder)}
         lead["name"] = os.path.basename(folder)
         peerlinkd.config["auto_approve_folders"] = [folder]
-        peerlinkd.launch = lambda sp: ("in tmux (tmux attach -t x)", None)
+        peerlinkd.launch = lambda sp: ("in a herdr core terminal (hc attach t1)", None)
         peerlinkd.save_spawns = lambda: None
         peerlinkd.inboxes.clear()
         try:

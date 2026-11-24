@@ -45,7 +45,7 @@ In any Claude Code session:
 /plugin install peerlink --marketplace dfunq/peerlink
 ```
 
-Answer `y` to add the marketplace and pick a scope. That's it: the next sessions you open find each other. Requires Python 3 on your `PATH` (3.10 or later recommended).
+Answer `y` to add the marketplace and pick a scope. That's it: the next sessions you open find each other. Requires Python 3 on your `PATH` (3.10 or later recommended). For agents to start other agents, install [herdr core](https://herdr.dev/core/) too (`curl -fsSL https://releases.herdr.dev/core/install.sh | sh`; on Windows, `powershell -c "irm https://releases.herdr.dev/core/install.ps1 | iex"`): started agents run in its terminals.
 
 (From a shell: `claude plugin install peerlink --marketplace dfunq/peerlink`. In the desktop app: + next to the prompt → Plugins → Add marketplace `dfunq/peerlink` → Add plugin.)
 
